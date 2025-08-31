@@ -158,6 +158,7 @@ class MapillaryDataModule(pl.LightningDataModule):
     def pack_data(self):
         # We pack the data into compact tensors
         # that can be shared across processes without copy.
+        # We group views by panorama to enable panorama-based batching.
         exclude = {
             "compass_angle",
             "compass_accuracy",
@@ -179,23 +180,90 @@ class MapillaryDataModule(pl.LightningDataModule):
             for scene, per_scene in self.dumps.items()
         }
         self.data = {}
+        self.panorama_groups = {}  # Store panorama grouping info
+
         for stage, names in self.splits.items():
-            view = self.dumps[names[0][0]][names[0][1]]["views"][names[0][2]]
-            data = {k: [] for k in view.keys() - exclude}
-            for scene, seq, name in names:
+            # Group views by panorama ID
+            panorama_views = self._group_views_by_panorama(names)
+
+            # Validate that we have complete panoramas (4 views each)
+            incomplete_panoramas = [
+                p_id for p_id, views in panorama_views.items() if len(views) != 4
+            ]
+            if incomplete_panoramas:
+                logger.warning(
+                    f"Found {len(incomplete_panoramas)} incomplete panoramas "
+                    f"in {stage} set. These will be excluded. "
+                    f"First few: {incomplete_panoramas[:5]}"
+                )
+                # Keep only complete panoramas
+                panorama_views = {
+                    p_id: views
+                    for p_id, views in panorama_views.items()
+                    if len(views) == 4
+                }
+
+            # Store panorama groups for this stage
+            self.panorama_groups[stage] = panorama_views
+
+            # Create flattened names list maintaining panorama view order
+            ordered_names = []
+            for p_id in sorted(panorama_views.keys()):
+                views = panorama_views[p_id]
+                # Sort views by suffix for consistent order:
+                # front, left, back, right
+                suffix_order = {"front": 0, "left": 1, "back": 2, "right": 3}
+                views_sorted = sorted(
+                    views, key=lambda x: suffix_order.get(x[2].split("_")[-1], 999)
+                )
+                ordered_names.extend(views_sorted)
+
+            # Pack data as before but with grouped panorama ordering
+            if ordered_names:
+                view = self.dumps[ordered_names[0][0]][ordered_names[0][1]]["views"][
+                    ordered_names[0][2]
+                ]
+                data = {k: [] for k in view.keys() - exclude}
+                for scene, seq, name in ordered_names:
+                    for k in data:
+                        data[k].append(
+                            self.dumps[scene][seq]["views"][name].get(k, None)
+                        )
                 for k in data:
-                    data[k].append(self.dumps[scene][seq]["views"][name].get(k, None))
-            for k in data:
-                v = np.array(data[k])
-                if np.issubdtype(v.dtype, np.integer) or np.issubdtype(
-                    v.dtype, np.floating
-                ):
-                    v = torch.from_numpy(v)
-                data[k] = v
-            data["cameras"] = cameras
-            data["points"] = points
-            self.data[stage] = data
-            self.splits[stage] = np.array(names)
+                    v = np.array(data[k])
+                    if np.issubdtype(v.dtype, np.integer) or np.issubdtype(
+                        v.dtype, np.floating
+                    ):
+                        v = torch.from_numpy(v)
+                    data[k] = v
+                data["cameras"] = cameras
+                data["points"] = points
+                self.data[stage] = data
+                self.splits[stage] = np.array(ordered_names)
+            else:
+                # Empty stage
+                self.data[stage] = {"cameras": cameras, "points": points}
+                self.splits[stage] = np.array([])
+
+    def _group_views_by_panorama(self, names):
+        """Group view names by panorama ID.
+
+        Args:
+            names: List of (scene, seq, name) tuples
+
+        Returns:
+            Dict mapping panorama_id to list of (scene, seq, name) tuples
+        """
+        panorama_views = defaultdict(list)
+        for scene, seq, name in names:
+            # Extract panorama ID from view name (everything before the last underscore)
+            if "_" in name:
+                panorama_id = name.rsplit("_", 1)[0]
+                panorama_views[panorama_id].append((scene, seq, name))
+            else:
+                # Handle non-panoramic views if any exist
+                panorama_views[name].append((scene, seq, name))
+        return dict(panorama_views)
 
     def filter_elements(self):
         for stage, names in self.splits.items():
@@ -299,10 +367,21 @@ class MapillaryDataModule(pl.LightningDataModule):
     ):
         dataset = self.dataset(stage)
         cfg = self.cfg["loading"][stage]
+        batch_size = cfg["batch_size"]
+
+        # Validate batch size is a multiple of views per panorama (4)
+        views_per_panorama = 4
+        if batch_size % views_per_panorama != 0:
+            raise ValueError(
+                f"Batch size ({batch_size}) must be a multiple of views per "
+                f"panorama ({views_per_panorama}). Each panorama contains "
+                f"{views_per_panorama} views: front, left, back, right."
+            )
+
         num_workers = cfg["num_workers"] if num_workers is None else num_workers
         loader = torchdata.DataLoader(
             dataset,
-            batch_size=cfg["batch_size"],
+            batch_size=batch_size,
             num_workers=num_workers,
             shuffle=shuffle or (stage == "train"),
             pin_memory=True,

@@ -89,12 +89,35 @@ class OrienterNet(BaseModel):
             self.register_parameter("temperature", temperature)
 
     def _is_panorama_batch(self, data):
-        """Check if the batch contains panorama views (groups of 3)"""
+        """
+        Check if the batch contains panorama views (groups of 3).
+        
+        Args:
+            data: Input data dict containing 'image' tensor
+            
+        Returns:
+            bool: True if batch size is multiple of 3 and >= 3, False otherwise
+        """
         batch_size = data["image"].shape[0]
         return batch_size % 3 == 0 and batch_size >= 3
 
     def _create_equilateral_triangle_mask(self, h, w, device):
-        """Create an equilateral triangle mask for concatenating BEV features"""
+        """
+        Create an equilateral triangle mask for concatenating BEV features.
+        
+        The triangle points upward (view1 direction) and is divided into 3 regions:
+        - View1: Top region (pointing up, 0 degrees)  
+        - View2: Bottom-left region (120 degrees from view1)
+        - View3: Bottom-right region (240 degrees from view1)
+        
+        Args:
+            h: Height of the feature map
+            w: Width of the feature map  
+            device: PyTorch device for tensor creation
+            
+        Returns:
+            dict: Dictionary with 'triangle', 'view1', 'view2', 'view3' masks
+        """
         center_y, center_x = h // 2, w // 2
         radius = min(h, w) // 2 - 2  # Leave some border
         
@@ -145,14 +168,19 @@ class OrienterNet(BaseModel):
 
     def _concatenate_panorama_bev_features(self, f_bev, valid_bev):
         """
-        Concatenate BEV features from 3 panorama views into equilateral triangle arrangement
+        Concatenate BEV features from 3 panorama views into equilateral triangle arrangement.
+        
+        Each panorama contains 3 views at 120-degree intervals:
+        - view1 (0°): placed in top triangle region
+        - view2 (120°): placed in bottom-left triangle region  
+        - view3 (240°): placed in bottom-right triangle region
         
         Args:
-            f_bev: [B, C, H, W] where B is multiple of 3
-            valid_bev: [B, H, W] 
+            f_bev: [B, C, H, W] where B is multiple of 3 - BEV features for all views
+            valid_bev: [B, H, W] - Valid masks for each view
             
         Returns:
-            f_bev_concat: [B//3, C, H, W] - Concatenated features in triangles
+            f_bev_concat: [B//3, C, H, W] - Concatenated features in triangular arrangement
             valid_concat: [B//3, H, W] - Valid masks for concatenated features
         """
         B, C, H, W = f_bev.shape
@@ -190,16 +218,18 @@ class OrienterNet(BaseModel):
 
     def _rotate_features_to_map(self, f_bev, valid_bev, yaw_view1):
         """
-        Rotate the concatenated BEV features to align with map orientation
-        The direction is determined by view1's yaw angle
+        Rotate the concatenated BEV features to align with map orientation.
+        
+        The rotation aligns the triangular panorama features with the encoded map tile
+        based on the yaw angle of view1 (which determines the "forward" direction).
         
         Args:
-            f_bev: [B, C, H, W] - Concatenated BEV features  
-            valid_bev: [B, H, W] - Valid masks
-            yaw_view1: [B] - Yaw angles of view1 for each panorama
+            f_bev: [B, C, H, W] - Concatenated BEV features in triangular arrangement
+            valid_bev: [B, H, W] - Valid masks for the features
+            yaw_view1: [B] - Yaw angles of view1 for each panorama (in radians)
             
         Returns:
-            f_bev_rotated: [B, C, H, W] - Rotated features
+            f_bev_rotated: [B, C, H, W] - Rotated features aligned with map
             valid_rotated: [B, H, W] - Rotated valid masks
         """
         B, C, H, W = f_bev.shape
@@ -290,30 +320,33 @@ class OrienterNet(BaseModel):
         # Check if we have panorama views and process accordingly
         is_panorama = self._is_panorama_batch(data)
         if is_panorama:
-            # Process panorama views: concatenate 3 views into equilateral triangle
+            # Panorama processing: concatenate 3 views into equilateral triangle
+            # This implements the core requirement to combine BEV features from
+            # view1 (0°), view2 (120°), view3 (240°) into a single triangular feature map
             f_bev_concat, valid_bev_concat = self._concatenate_panorama_bev_features(f_bev, valid_bev)
             
             # Get yaw angles for view1 (every 3rd view starting from 0)
-            # Assume yaw data is provided for rotation alignment
+            # This determines the orientation of the concatenated features
             if "roll_pitch_yaw" in data:
                 yaw_all = data["roll_pitch_yaw"][..., -1]  # Get yaw component
                 yaw_view1 = yaw_all[::3]  # Every 3rd element (view1 of each panorama)
                 
-                # Rotate concatenated features to align with map
+                # Rotate concatenated features to align with map tiles
+                # This ensures the triangular features match the map coordinate system
                 f_bev_final, valid_bev_final = self._rotate_features_to_map(
                     f_bev_concat, valid_bev_concat, yaw_view1
                 )
             else:
-                # If no yaw data, use concatenated features without rotation
+                # If no yaw data available, use concatenated features without rotation
                 f_bev_final, valid_bev_final = f_bev_concat, valid_bev_concat
             
-            # Store both individual and concatenated features for potential analysis
+            # Store both individual and concatenated features for potential analysis/debugging
             pred["features_bev_individual"] = f_bev
             pred["valid_bev_individual"] = valid_bev
             pred["features_bev_concatenated"] = f_bev_concat
             pred["valid_bev_concatenated"] = valid_bev_concat
         else:
-            # Standard single-view processing
+            # Standard single-view processing (backwards compatible)
             f_bev_final, valid_bev_final = f_bev, valid_bev
 
         # Use the final BEV features for exhaustive voting

@@ -8,7 +8,7 @@ model:
   latent_dim: 128
   matching_dim: 8
   z_max: 32
-  x_max: 32
+  x_max: 55
   pixel_per_meter: ${data.pixel_per_meter}
   num_scale_bins: 33
   num_rotations: 64

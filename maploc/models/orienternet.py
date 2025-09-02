@@ -121,8 +121,8 @@ class OrienterNet(BaseModel):
         center_y, center_x = h // 2, w // 2
         # Change side length to h as requested
         side_length = h
-        # For equilateral triangle: circumradius = side_length / sqrt(3)
-        radius = side_length / np.sqrt(3)
+        # For equilateral triangle with side length s, height = s * sqrt(3) / 2
+        triangle_height = side_length * np.sqrt(3) / 2
 
         # Create coordinate grids
         y, x = torch.meshgrid(
@@ -131,18 +131,19 @@ class OrienterNet(BaseModel):
             indexing="ij",
         )
 
-        # Equilateral triangle vertices (pointing up, like view1 direction)
-        # Top vertex (view1)
-        top_y = center_y - radius * np.sqrt(3) / 2
+        # Equilateral triangle vertices with side length = h
+        # For an equilateral triangle, the center is at 1/3 of height from base
+        # Top vertex (view1) - pointing up
+        top_y = center_y - triangle_height / 3 * 2
         top_x = center_x
 
         # Bottom-left vertex (view2, 120 degrees from view1)
-        bl_y = center_y + radius * np.sqrt(3) / 4
-        bl_x = center_x - radius * 3 / 4
+        bl_y = center_y + triangle_height / 3
+        bl_x = center_x - side_length / 2
 
         # Bottom-right vertex (view3, 240 degrees from view1)
-        br_y = center_y + radius * np.sqrt(3) / 4
-        br_x = center_x + radius * 3 / 4
+        br_y = center_y + triangle_height / 3
+        br_x = center_x + side_length / 2
 
         # Use barycentric coordinates to determine if point is inside triangle
         def point_in_triangle(px, py, x1, y1, x2, y2, x3, y3):
@@ -159,13 +160,17 @@ class OrienterNet(BaseModel):
 
         # Divide triangle into 3 regions for the 3 views
         # View1 region: top third (near top vertex)
-        view1_mask = triangle_mask & (y < center_y - radius / 4)
+        view1_mask = triangle_mask & (y < center_y - triangle_height / 6)
 
         # View2 region: bottom-left third
-        view2_mask = triangle_mask & (y >= center_y - radius / 4) & (x < center_x)
+        view2_mask = triangle_mask & (y >= center_y - triangle_height / 6) & (
+            x < center_x
+        )
 
         # View3 region: bottom-right third
-        view3_mask = triangle_mask & (y >= center_y - radius / 4) & (x >= center_x)
+        view3_mask = triangle_mask & (y >= center_y - triangle_height / 6) & (
+            x >= center_x
+        )
 
         return {
             "triangle": triangle_mask,

@@ -2,6 +2,7 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.functional import normalize
 
 from . import get_model
@@ -87,6 +88,151 @@ class OrienterNet(BaseModel):
             temperature = torch.nn.Parameter(torch.tensor(0.0))
             self.register_parameter("temperature", temperature)
 
+    def _is_panorama_batch(self, data):
+        """Check if the batch contains panorama views (groups of 3)"""
+        batch_size = data["image"].shape[0]
+        return batch_size % 3 == 0 and batch_size >= 3
+
+    def _create_equilateral_triangle_mask(self, h, w, device):
+        """Create an equilateral triangle mask for concatenating BEV features"""
+        center_y, center_x = h // 2, w // 2
+        radius = min(h, w) // 2 - 2  # Leave some border
+        
+        # Create coordinate grids
+        y, x = torch.meshgrid(torch.arange(h, device=device), 
+                             torch.arange(w, device=device), indexing='ij')
+        
+        # Equilateral triangle vertices (pointing up, like view1 direction)
+        # Top vertex (view1)
+        top_y = center_y - radius * np.sqrt(3) / 2
+        top_x = center_x
+        
+        # Bottom-left vertex (view2, 120 degrees from view1)
+        bl_y = center_y + radius * np.sqrt(3) / 4
+        bl_x = center_x - radius * 3 / 4
+        
+        # Bottom-right vertex (view3, 240 degrees from view1)
+        br_y = center_y + radius * np.sqrt(3) / 4
+        br_x = center_x + radius * 3 / 4
+        
+        # Use barycentric coordinates to determine if point is inside triangle
+        def point_in_triangle(px, py, x1, y1, x2, y2, x3, y3):
+            denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+            a = ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3)) / denom
+            b = ((y3 - y1) * (px - x3) + (x1 - x3) * (py - y3)) / denom
+            c = 1 - a - b
+            return (a >= 0) & (b >= 0) & (c >= 0)
+        
+        # Overall triangle mask
+        triangle_mask = point_in_triangle(x.float(), y.float(), top_x, top_y, bl_x, bl_y, br_x, br_y)
+        
+        # Divide triangle into 3 regions for the 3 views
+        # View1 region: top third (near top vertex)
+        view1_mask = triangle_mask & (y < center_y - radius / 4)
+        
+        # View2 region: bottom-left third
+        view2_mask = triangle_mask & (y >= center_y - radius / 4) & (x < center_x)
+        
+        # View3 region: bottom-right third  
+        view3_mask = triangle_mask & (y >= center_y - radius / 4) & (x >= center_x)
+        
+        return {
+            'triangle': triangle_mask,
+            'view1': view1_mask,
+            'view2': view2_mask,
+            'view3': view3_mask
+        }
+
+    def _concatenate_panorama_bev_features(self, f_bev, valid_bev):
+        """
+        Concatenate BEV features from 3 panorama views into equilateral triangle arrangement
+        
+        Args:
+            f_bev: [B, C, H, W] where B is multiple of 3
+            valid_bev: [B, H, W] 
+            
+        Returns:
+            f_bev_concat: [B//3, C, H, W] - Concatenated features in triangles
+            valid_concat: [B//3, H, W] - Valid masks for concatenated features
+        """
+        B, C, H, W = f_bev.shape
+        device = f_bev.device
+        assert B % 3 == 0, "Batch size must be multiple of 3 for panorama processing"
+        
+        num_panoramas = B // 3
+        
+        # Create triangle masks once
+        masks = self._create_equilateral_triangle_mask(H, W, device)
+        
+        # Initialize output tensors
+        f_bev_concat = torch.zeros((num_panoramas, C, H, W), device=device, dtype=f_bev.dtype)
+        valid_concat = torch.zeros((num_panoramas, H, W), device=device, dtype=torch.bool)
+        
+        # Process each panorama
+        for pano_idx in range(num_panoramas):
+            # Get the 3 views for this panorama
+            start_idx = pano_idx * 3
+            view_indices = [start_idx, start_idx + 1, start_idx + 2]
+            view_names = ['view1', 'view2', 'view3']
+            
+            for i, view_name in enumerate(view_names):
+                view_idx = view_indices[i]
+                mask = masks[view_name]
+                
+                # Apply both triangle mask and original valid mask
+                combined_mask = mask & valid_bev[view_idx]
+                
+                # Copy features where mask is true
+                f_bev_concat[pano_idx, :, combined_mask] = f_bev[view_idx, :, combined_mask]
+                valid_concat[pano_idx, combined_mask] = True
+        
+        return f_bev_concat, valid_concat
+
+    def _rotate_features_to_map(self, f_bev, valid_bev, yaw_view1):
+        """
+        Rotate the concatenated BEV features to align with map orientation
+        The direction is determined by view1's yaw angle
+        
+        Args:
+            f_bev: [B, C, H, W] - Concatenated BEV features  
+            valid_bev: [B, H, W] - Valid masks
+            yaw_view1: [B] - Yaw angles of view1 for each panorama
+            
+        Returns:
+            f_bev_rotated: [B, C, H, W] - Rotated features
+            valid_rotated: [B, H, W] - Rotated valid masks
+        """
+        B, C, H, W = f_bev.shape
+        device = f_bev.device
+        
+        # Convert yaw to rotation matrices for grid sampling
+        # PyTorch grid_sample expects rotation in radians, counter-clockwise
+        cos_yaw = torch.cos(-yaw_view1)  # Negative because we want to rotate features to match map
+        sin_yaw = torch.sin(-yaw_view1)
+        
+        # Create rotation matrices [B, 2, 3] for affine transformation
+        rotation_matrices = torch.zeros((B, 2, 3), device=device, dtype=f_bev.dtype)
+        rotation_matrices[:, 0, 0] = cos_yaw
+        rotation_matrices[:, 0, 1] = -sin_yaw
+        rotation_matrices[:, 1, 0] = sin_yaw
+        rotation_matrices[:, 1, 1] = cos_yaw
+        # Translation is 0 (rotation around center)
+        
+        # Create sampling grid
+        grid = F.affine_grid(rotation_matrices, (B, C, H, W), align_corners=False)
+        
+        # Rotate features
+        f_bev_rotated = F.grid_sample(f_bev, grid, mode='bilinear', 
+                                     padding_mode='zeros', align_corners=False)
+        
+        # Rotate valid masks (need to add channel dimension for grid_sample)
+        valid_expanded = valid_bev.unsqueeze(1).float()  # [B, 1, H, W]
+        valid_rotated_expanded = F.grid_sample(valid_expanded, grid, mode='nearest',
+                                              padding_mode='zeros', align_corners=False)
+        valid_rotated = (valid_rotated_expanded.squeeze(1) > 0.5).bool()  # [B, H, W]
+        
+        return f_bev_rotated, valid_rotated
+
     def exhaustive_voting(self, f_bev, f_map, valid_bev, confidence_bev=None):
         if self.conf.normalize_features:
             f_bev = normalize(f_bev, dim=1)
@@ -141,8 +287,38 @@ class OrienterNet(BaseModel):
             pred_bev = pred["bev"] = self.bev_net({"input": f_bev})
             f_bev = pred_bev["output"]
 
+        # Check if we have panorama views and process accordingly
+        is_panorama = self._is_panorama_batch(data)
+        if is_panorama:
+            # Process panorama views: concatenate 3 views into equilateral triangle
+            f_bev_concat, valid_bev_concat = self._concatenate_panorama_bev_features(f_bev, valid_bev)
+            
+            # Get yaw angles for view1 (every 3rd view starting from 0)
+            # Assume yaw data is provided for rotation alignment
+            if "roll_pitch_yaw" in data:
+                yaw_all = data["roll_pitch_yaw"][..., -1]  # Get yaw component
+                yaw_view1 = yaw_all[::3]  # Every 3rd element (view1 of each panorama)
+                
+                # Rotate concatenated features to align with map
+                f_bev_final, valid_bev_final = self._rotate_features_to_map(
+                    f_bev_concat, valid_bev_concat, yaw_view1
+                )
+            else:
+                # If no yaw data, use concatenated features without rotation
+                f_bev_final, valid_bev_final = f_bev_concat, valid_bev_concat
+            
+            # Store both individual and concatenated features for potential analysis
+            pred["features_bev_individual"] = f_bev
+            pred["valid_bev_individual"] = valid_bev
+            pred["features_bev_concatenated"] = f_bev_concat
+            pred["valid_bev_concatenated"] = valid_bev_concat
+        else:
+            # Standard single-view processing
+            f_bev_final, valid_bev_final = f_bev, valid_bev
+
+        # Use the final BEV features for exhaustive voting
         scores = self.exhaustive_voting(
-            f_bev, f_map, valid_bev, pred_bev.get("confidence")
+            f_bev_final, f_map, valid_bev_final, pred_bev.get("confidence")
         )
         scores = scores.moveaxis(1, -1)  # B,H,W,N
         if "log_prior" in pred_map and self.conf.apply_map_prior:
@@ -168,13 +344,26 @@ class OrienterNet(BaseModel):
             "uv_expectation": uvr_avg[..., :2],
             "yaw_expectation": uvr_avg[..., 2],
             "features_image": f_image,
-            "features_bev": f_bev,
-            "valid_bev": valid_bev.squeeze(1),
+            "features_bev": f_bev_final,
+            "valid_bev": valid_bev_final.squeeze(1) if valid_bev_final.dim() == 3 else valid_bev_final,
+            "is_panorama": is_panorama,
         }
 
     def loss(self, pred, data):
-        xy_gt = data["uv"]
-        yaw_gt = data["roll_pitch_yaw"][..., -1]
+        # Handle panorama batches - use ground truth from view1 of each panorama
+        if pred.get("is_panorama", False):
+            # For panorama batches, take ground truth from view1 (every 3rd element)
+            xy_gt = data["uv"][::3]  # view1 ground truth positions
+            yaw_gt = data["roll_pitch_yaw"][::3, -1]  # view1 ground truth yaw
+            mask = data.get("map_mask")
+            if mask is not None:
+                mask = mask[::3]  # view1 masks
+        else:
+            # Standard single-view processing
+            xy_gt = data["uv"]
+            yaw_gt = data["roll_pitch_yaw"][..., -1]
+            mask = data.get("map_mask")
+            
         if self.conf.do_label_smoothing:
             nll = nll_loss_xyr_smoothed(
                 pred["log_probs"],
@@ -182,7 +371,7 @@ class OrienterNet(BaseModel):
                 yaw_gt,
                 self.conf.sigma_xy / self.conf.pixel_per_meter,
                 self.conf.sigma_r,
-                mask=data.get("map_mask"),
+                mask=mask,
             )
         else:
             nll = nll_loss_xyr(pred["log_probs"], xy_gt, yaw_gt)

@@ -186,9 +186,9 @@ class MapillaryDataModule(pl.LightningDataModule):
             # Group views by panorama ID
             panorama_views = self._group_views_by_panorama(names)
 
-            # Validate that we have complete panoramas (4 views each)
+            # Validate that we have complete panoramas (3 views each)
             incomplete_panoramas = [
-                p_id for p_id, views in panorama_views.items() if len(views) != 4
+                p_id for p_id, views in panorama_views.items() if len(views) != 3
             ]
             if incomplete_panoramas:
                 logger.warning(
@@ -200,7 +200,7 @@ class MapillaryDataModule(pl.LightningDataModule):
                 panorama_views = {
                     p_id: views
                     for p_id, views in panorama_views.items()
-                    if len(views) == 4
+                    if len(views) == 3
                 }
 
             # Store panorama groups for this stage
@@ -212,7 +212,7 @@ class MapillaryDataModule(pl.LightningDataModule):
                 views = panorama_views[p_id]
                 # Sort views by suffix for consistent order:
                 # front, left, back, right
-                suffix_order = {"front": 0, "left": 1, "back": 2, "right": 3}
+                suffix_order = {"view1": 0, "view2": 1, "view3": 2}
                 views_sorted = sorted(
                     views, key=lambda x: suffix_order.get(x[2].split("_")[-1], 999)
                 )
@@ -369,13 +369,13 @@ class MapillaryDataModule(pl.LightningDataModule):
         cfg = self.cfg["loading"][stage]
         batch_size = cfg["batch_size"]
 
-        # Validate batch size is a multiple of views per panorama (4)
-        views_per_panorama = 4
+        # Validate batch size is a multiple of views per panorama (3)
+        views_per_panorama = 3
         if batch_size % views_per_panorama != 0:
             raise ValueError(
                 f"Batch size ({batch_size}) must be a multiple of views per "
                 f"panorama ({views_per_panorama}). Each panorama contains "
-                f"{views_per_panorama} views: front, left, back, right."
+                f"{views_per_panorama} views: view1, view2, view3."
             )
 
         num_workers = cfg["num_workers"] if num_workers is None else num_workers

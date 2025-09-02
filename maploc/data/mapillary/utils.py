@@ -27,7 +27,9 @@ def keyframe_selection(shots: List[Shot], min_dist: float = 4) -> List[int]:
 
 
 def perspective_camera_from_pano(camera: Camera, size: int) -> Camera:
-    camera_new = Camera.create_perspective(0.5, 0, 0)
+    fov = 120
+    focal_ratio = 0.5 / np.tan(np.radians(fov / 2))
+    camera_new = Camera.create_perspective(focal_ratio, 0, 0)
     camera_new.height = camera_new.width = size
     camera_new.id = "perspective_from_pano"
     return camera_new
@@ -114,15 +116,16 @@ def render_panorama(
     undistorter: PanoramaUndistorter,
     offset: float = 0.0,
 ) -> Tuple[List[Shot], List[np.ndarray]]:
-    yaws = [0, 90, 180, 270]
-    suffixes = ["front", "left", "back", "right"]
+    # Change the yaw according to the degree of FoV
+    yaws = [0, 120, 240]
+    suffixes = ["view1", "view2", "view3"]
     images = []
     shots = []
 
     # To reduce aliasing, since cv2.remap does not support area samplimg,
     # we first resize with anti-aliasing.
     h, w = undistorter.shape
-    h, w = (w * 2, w * 4)  # assuming 90deg FOV
+    h, w = (int(w * 1.5), w * 3)  # assuming 90deg FOV
     pano_resized = cv2.resize(pano, (w, h), interpolation=cv2.INTER_AREA)
 
     for yaw, suffix in zip(yaws, suffixes):

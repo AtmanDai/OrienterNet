@@ -53,6 +53,7 @@ class OrienterNet(BaseModel):
         "retrieval_dim": None,
     }
 
+
     def _init(self, conf):
         assert not self.conf.norm_depth_scores
         assert self.conf.depth_parameterization == "scale"
@@ -90,13 +91,16 @@ class OrienterNet(BaseModel):
         if conf.add_temperature:
             temperature = torch.nn.Parameter(torch.tensor(0.0))
             self.register_parameter("temperature", temperature)
+        
+        # Define the number of views a pano contains
+        self.num_views = 3
 
-    def _is_panorama_batch(self, data):
+    def _is_panorama_batch(self, data, num_views):
         """
         Check if the batch contains panorama views (groups of 3).
         """
         batch_size = data["image"].shape[0]
-        return batch_size % 3 == 0 and batch_size >= 3
+        return batch_size % num_views == 0 and batch_size >= num_views
     
     def _create_blending_weights(self, H, W, device):
         """
@@ -252,16 +256,12 @@ class OrienterNet(BaseModel):
             f_v2_masked = torch.where(v_v2_rot.unsqueeze(0), f_v2_rot, 0.0)
             f_v3_masked = torch.where(v_v3_rot.unsqueeze(0), f_v3_rot, 0.0)
             
-            w_v1_masked = torch.where(v_v1_rot.squeeze(0), w_v1_rot, 0.0)
-            w_v2_masked = torch.where(v_v2_rot.squeeze(0), w_v2_rot, 0.0)
-            w_v3_masked = torch.where(v_v3_rot.squeeze(0), w_v3_rot, 0.0)
-
-            numerator = (f_v1_masked * w_v1_masked.unsqueeze(0) +
-                         f_v2_masked * w_v2_masked.unsqueeze(0) +
-                         f_v3_masked * w_v3_masked.unsqueeze(0))
+            numerator = (f_v1_masked * v_v1_rot.unsqueeze(0).float() +
+                     f_v2_masked * v_v2_rot.unsqueeze(0).float() +
+                     f_v3_masked * v_v3_rot.unsqueeze(0).float())
             
-            denominator = w_v1_rot + w_v2_rot + w_v3_rot
-            denominator = torch.clamp(denominator, min=1e-6)
+            denominator = (v_v1_rot.float() + v_v2_rot.float() + v_v3_rot.float())
+            denominator = torch.clamp(denominator, min=0.5)
 
             f_bev_stitched[i] = numerator / denominator.unsqueeze(0)
 
@@ -329,7 +329,7 @@ class OrienterNet(BaseModel):
             f_bev = pred_bev["output"]
 
         # Check if we have panorama views and process accordingly
-        is_panorama = self._is_panorama_batch(data)
+        is_panorama = self._is_panorama_batch(data, num_views=self.num_views)
         confidence_bev = pred_bev.get("confidence")
         
         if is_panorama:

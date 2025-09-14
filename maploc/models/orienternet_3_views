@@ -102,35 +102,6 @@ class OrienterNet(BaseModel):
         batch_size = data["image"].shape[0]
         return batch_size % num_views == 0 and batch_size >= num_views
     
-    def _create_blending_weights(self, H, W, device):
-        """
-        Create a weighted mask, the weight decline from the center with 1 to edge with 0
-        """
-        y, x = torch.meshgrid(
-            torch.arange(H, device=device, dtype=torch.float32),
-            torch.arange(W, device=device, dtype=torch.float32),
-            indexing='ij'
-        )
-        
-        # Move the origin to the center of the camera
-        x = x - (W - 1) / 2
-        y = (H - 1) - y
-
-
-        angle = torch.atan2(y, x) # 角度范围是 [-pi, pi]
-        
-        # Within +/- 60 degree (pi/3) decline from 1 to 0 
-        center_angle = torch.tensor(np.pi / 2, device=device)
-        
-        angular_distance = torch.abs(angle - center_angle)
-        
-        half_angle_width = torch.tensor(np.pi / 3, device=device)
-        
-        # 在边界处稍微扩大一点范围 (e.g., 61度) 来确保平滑
-        weights = 1.0 - torch.clamp(angular_distance / (half_angle_width * 1.02), 0, 1)
-        
-        return weights
-    
     def _rotate_bev_around_camera(self, features, angle_deg):
 
         is_3d = features.dim() == 3
@@ -210,7 +181,6 @@ class OrienterNet(BaseModel):
         valid_stitched = torch.zeros(
             (num_panoramas, 4*H, W), device=device, dtype=torch.bool
         )
-        blending_weights = self._create_blending_weights(H, W, device)
 
         for i in range(num_panoramas):
             start_idx = i * 3
@@ -227,7 +197,6 @@ class OrienterNet(BaseModel):
                 )
                 .squeeze(0) > 0.5
             )
-            w_v1_rot = self._rotate_bev_around_camera(blending_weights.unsqueeze(0).unsqueeze(0), 0).squeeze(0).squeeze(0)
             
             # View 2 (clockwise +120 deg yaw): Rotate its content by -120 deg to align.
             f_v2_rot = self._rotate_bev_around_camera(f_v2, -120)
@@ -237,7 +206,6 @@ class OrienterNet(BaseModel):
                 )
                 .squeeze(0) > 0.5
             )
-            w_v2_rot = self._rotate_bev_around_camera(blending_weights.unsqueeze(0).unsqueeze(0), -120).squeeze(0).squeeze(0)
 
             # View 3 (+240 deg yaw): Rotate its content by -240 deg (i.e., +120 deg) to align.
             f_v3_rot = self._rotate_bev_around_camera(f_v3, 120)
@@ -247,7 +215,6 @@ class OrienterNet(BaseModel):
                 )
                 .squeeze(0) > 0.5
             )
-            w_v3_rot = self._rotate_bev_around_camera(blending_weights.unsqueeze(0).unsqueeze(0), 120).squeeze(0).squeeze(0)
 
             
             # --- Robust Pasting Logic ---
